@@ -2,16 +2,16 @@ import json
 import uuid
 import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Iterator, List, Generator, Any
+from typing import Dict, Optional, Tuple, Iterator, List, AsyncGenerator, Any
 import struct
-import requests
+import httpx
 
 class StreamTracker:
     def __init__(self):
         self.has_content = False
     
-    def track(self, gen: Generator[str, None, None]) -> Generator[str, None, None]:
-        for item in gen:
+    async def track(self, gen: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+        async for item in gen:
             if item:
                 self.has_content = True
             yield item
@@ -192,7 +192,7 @@ def inject_model(body_json: Dict[str, Any], model: Optional[str]) -> None:
     except Exception:
         pass
 
-def send_chat_request(access_token: str, messages: List[Dict[str, Any]], model: Optional[str] = None, stream: bool = False, timeout: Tuple[int,int] = (15,300)) -> Tuple[Optional[str], Optional[Generator[str, None, None]], bool]:
+async def send_chat_request(access_token: str, messages: List[Dict[str, Any]], model: Optional[str] = None, stream: bool = False, timeout: Tuple[int,int] = (15,300)) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], StreamTracker]:
     url, headers_from_log, body_json = load_template()
     headers_from_log["amz-sdk-invocation-id"] = str(uuid.uuid4())
     try:
@@ -204,39 +204,54 @@ def send_chat_request(access_token: str, messages: List[Dict[str, Any]], model: 
     inject_model(body_json, model)
     payload_str = json.dumps(body_json, ensure_ascii=False)
     headers = _merge_headers(headers_from_log, access_token)
-    session = requests.Session()
+    
+    # Build mounts with proxy if available
     proxies = _get_proxies()
-    resp = session.post(url, headers=headers, data=payload_str, stream=True, timeout=timeout, proxies=proxies)
-    if resp.status_code >= 400:
-        try:
-            err = resp.text
-        except Exception:
-            err = f"HTTP {resp.status_code}"
-        raise requests.HTTPError(f"Upstream error {resp.status_code}: {err}", response=resp)
-    parser = AwsEventStreamParser()
-    tracker = StreamTracker()
-    def _iter_text() -> Generator[str, None, None]:
-        for chunk in resp.iter_content(chunk_size=None):
-            if not chunk:
-                continue
-            events = parser.feed(chunk)
-            for _ev_headers, payload in events:
-                parsed = _try_decode_event_payload(payload)
-                if parsed is not None:
-                    text = _extract_text_from_event(parsed)
-                    if isinstance(text, str) and text:
-                        yield text
-                else:
-                    try:
-                        txt = payload.decode("utf-8", errors="ignore")
-                        if txt:
-                            yield txt
-                    except Exception:
-                        pass
-    if stream:
-        return None, tracker.track(_iter_text()), tracker
-    else:
-        buf = []
-        for t in tracker.track(_iter_text()):
-            buf.append(t)
-        return "".join(buf), None, tracker
+    mounts = None
+    if proxies:
+        proxy_url = proxies.get("https") or proxies.get("http")
+        if proxy_url:
+            mounts = {
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            }
+    
+    async with httpx.AsyncClient(mounts=mounts, timeout=httpx.Timeout(timeout[0], read=timeout[1])) as client:
+        async with client.stream("POST", url, headers=headers, content=payload_str) as resp:
+            if resp.status_code >= 400:
+                try:
+                    err = await resp.aread()
+                    err = err.decode("utf-8", errors="ignore")
+                except Exception:
+                    err = f"HTTP {resp.status_code}"
+                raise httpx.HTTPError(f"Upstream error {resp.status_code}: {err}")
+            
+            parser = AwsEventStreamParser()
+            tracker = StreamTracker()
+            
+            async def _iter_text() -> AsyncGenerator[str, None]:
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    events = parser.feed(chunk)
+                    for _ev_headers, payload in events:
+                        parsed = _try_decode_event_payload(payload)
+                        if parsed is not None:
+                            text = _extract_text_from_event(parsed)
+                            if isinstance(text, str) and text:
+                                yield text
+                        else:
+                            try:
+                                txt = payload.decode("utf-8", errors="ignore")
+                                if txt:
+                                    yield txt
+                            except Exception:
+                                pass
+            
+            if stream:
+                return None, tracker.track(_iter_text()), tracker
+            else:
+                buf = []
+                async for t in tracker.track(_iter_text()):
+                    buf.append(t)
+                return "".join(buf), None, tracker

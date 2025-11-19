@@ -2,9 +2,10 @@ import json
 import time
 import uuid
 import os
+import asyncio
 from typing import Dict, Tuple, Optional
 
-import requests
+import httpx
 
 def _get_proxies() -> Optional[Dict[str, str]]:
     proxy = os.getenv("HTTP_PROXY", "").strip()
@@ -34,15 +35,15 @@ def make_headers() -> Dict[str, str]:
     }
 
 
-def post_json(url: str, payload: Dict) -> requests.Response:
+async def post_json(client: httpx.AsyncClient, url: str, payload: Dict) -> httpx.Response:
     # Keep JSON order and mimic body closely to v1
     payload_str = json.dumps(payload, ensure_ascii=False)
     headers = make_headers()
-    resp = requests.post(url, headers=headers, data=payload_str, timeout=(15, 60), proxies=_get_proxies())
+    resp = await client.post(url, headers=headers, content=payload_str, timeout=httpx.Timeout(15.0, read=60.0))
     return resp
 
 
-def register_client_min() -> Tuple[str, str]:
+async def register_client_min() -> Tuple[str, str]:
     """
     Register an OIDC client (minimal) and return (clientId, clientSecret).
     """
@@ -55,13 +56,23 @@ def register_client_min() -> Tuple[str, str]:
             "codewhisperer:conversations",
         ],
     }
-    r = post_json(REGISTER_URL, payload)
-    r.raise_for_status()
-    data = r.json()
-    return data["clientId"], data["clientSecret"]
+    proxies = _get_proxies()
+    mounts = None
+    if proxies:
+        proxy_url = proxies.get("https") or proxies.get("http")
+        if proxy_url:
+            mounts = {
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            }
+    async with httpx.AsyncClient(mounts=mounts) as client:
+        r = await post_json(client, REGISTER_URL, payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["clientId"], data["clientSecret"]
 
 
-def device_authorize(client_id: str, client_secret: str) -> Dict:
+async def device_authorize(client_id: str, client_secret: str) -> Dict:
     """
     Start device authorization. Returns dict that includes:
     - deviceCode
@@ -75,12 +86,22 @@ def device_authorize(client_id: str, client_secret: str) -> Dict:
         "clientSecret": client_secret,
         "startUrl": START_URL,
     }
-    r = post_json(DEVICE_AUTH_URL, payload)
-    r.raise_for_status()
-    return r.json()
+    proxies = _get_proxies()
+    mounts = None
+    if proxies:
+        proxy_url = proxies.get("https") or proxies.get("http")
+        if proxy_url:
+            mounts = {
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            }
+    async with httpx.AsyncClient(mounts=mounts) as client:
+        r = await post_json(client, DEVICE_AUTH_URL, payload)
+        r.raise_for_status()
+        return r.json()
 
 
-def poll_token_device_code(
+async def poll_token_device_code(
     client_id: str,
     client_secret: str,
     device_code: str,
@@ -94,7 +115,7 @@ def poll_token_device_code(
     Returns token dict with at least 'accessToken' and optionally 'refreshToken'.
     Raises:
       - TimeoutError on timeout
-      - requests.HTTPError for non-recoverable HTTP errors
+      - httpx.HTTPError for non-recoverable HTTP errors
     """
     payload = {
         "clientId": client_id,
@@ -111,22 +132,33 @@ def poll_token_device_code(
     # Ensure interval sane
     poll_interval = max(1, int(interval or 1))
 
-    while time.time() < deadline:
-        r = post_json(TOKEN_URL, payload)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code == 400:
-            # Expect AuthorizationPendingException early on
-            try:
-                err = r.json()
-            except Exception:
-                err = {"error": r.text}
-            if str(err.get("error")) == "authorization_pending":
-                time.sleep(poll_interval)
-                continue
-            # Other 4xx are errors
+    proxies = _get_proxies()
+    mounts = None
+    if proxies:
+        proxy_url = proxies.get("https") or proxies.get("http")
+        if proxy_url:
+            mounts = {
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            }
+    
+    async with httpx.AsyncClient(mounts=mounts) as client:
+        while time.time() < deadline:
+            r = await post_json(client, TOKEN_URL, payload)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 400:
+                # Expect AuthorizationPendingException early on
+                try:
+                    err = r.json()
+                except Exception:
+                    err = {"error": r.text}
+                if str(err.get("error")) == "authorization_pending":
+                    await asyncio.sleep(poll_interval)
+                    continue
+                # Other 4xx are errors
+                r.raise_for_status()
+            # Non-200, non-400
             r.raise_for_status()
-        # Non-200, non-400
-        r.raise_for_status()
 
     raise TimeoutError("Device authorization expired before approval (timeout reached)")
